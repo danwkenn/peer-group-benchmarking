@@ -1,0 +1,948 @@
+---
+title: "Statistical Learning Benchmarking with Random Forests"
+author: "Daniel Kennedy"
+date: "21/09/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+# install.packages("tidyverse")
+# devtools::install_github("bgregorutti/RFgroove")
+# devtools::install_github("danwkenn/Benchtools")
+library(tidyverse)
+library(RFgroove)
+library(parallel)
+library(Benchtools)
+
+# Palette for figures (accessible for colour blindness) with grey:
+cbPalette <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7","#999999")
+
+```
+
+Data are preprocessed
+
+```{r}
+# Read in preprocessed data
+preprocessed_data <- read_rds(file = "../../data/preprocessed-data.RDS")
+data2017 <- preprocessed_data$data2017
+data2017_raw <- readRDS(file = "../../data/tDF.201700.rds")
+
+response_vars <- c("response1","response2")
+data2017[,response_vars] <- data2017_raw$D[,response_vars]
+response_scalings <- lapply(X = response_vars,
+                            FUN = function(x){
+                              list(
+                                mean = mean(data2017[[x]]),
+                                sd = sd(data2017[[x]])
+                            )})
+names(response_scalings) <- response_vars
+
+NUMERIC_COLUMNS <- which(sapply(data2017,is.numeric))
+for(cols in NUMERIC_COLUMNS){
+  data2017[[cols]] <- scale(data2017[[cols]])
+}
+```
+
+```{r}
+dissim_mats <- get_dissim_mats("../../data/profRegr-results-D-fa/",n_cores = 3)
+dissim_mat <- combine_dissim_mats(dissim_mats)[[1]]
+clusters <- hclust_constr_full(d = dissim_mat,check_function = upper_limit,limit = 101, method = "ward.D2",indices = "ch")
+```
+
+```{r}
+data_list <- list()
+for(r in response_vars){
+  data_list[[r]] <- data2017[,!(colnames(data2017) %in% setdiff(response_vars,r))]
+  data_list[[r]] <- cbind(data_list[[r]],cluster = as.factor(clusters))
+}
+
+r = "response1"
+```
+
+
+```{r}
+formula = as.formula(paste0(r," ~ ."))
+library(caret)
+caret_fit <- 
+  train(
+    formula,
+    data = data_list[[r]],
+    tuneGrid = expand.grid(mtry = c(1:13)),
+    trControl = trainControl(method = "repeatedcv",number = 10,repeats = 3),
+    method = "rf",
+    ntree = 300,
+    importance=TRUE,
+    keep.inbag = TRUE,
+    proximity = TRUE
+  )
+
+caret_lm_fit <- 
+  train(
+    formula,
+    data = data_list[[r]],
+    trControl = trainControl(method = "repeatedcv",number = 10,repeats = 3),
+    method = "lm"
+  )
+```
+
+```{r}
+caret_fit
+caret_lm_fit
+```
+
+```{r}
+library(tibble)
+plot_data <- 
+  tibble(
+    ntrees = 1:caret_fit$finalModel$ntree,
+    RMSE = caret_fit$finalModel$mse,
+    `italic(R)^2` = caret_fit$finalModel$rsq)
+
+lm_accuracy_data <- caret_lm_fit$results %>% select(RMSE = RMSE, `italic(R)^2` = Rsquared) %>%  reshape2::melt()
+lm_accuracy_sd_data <- caret_lm_fit$results %>% select(RMSE = RMSESD, `italic(R)^2` = RsquaredSD) %>%  reshape2::melt(value.name = "SD")
+lm_accuracy_data <- full_join(lm_accuracy_data, lm_accuracy_sd_data)
+
+ribbon_data <- lm_accuracy_data
+ribbon_data$x <- lapply(1:nrow(ribbon_data), FUN = function(x){c(-Inf,Inf)})
+ribbon_data <- ribbon_data %>% unnest(x)
+
+plot_data <- reshape2::melt(data = plot_data, id = "ntrees")
+tree_rmse_plot <- ggplot(data = plot_data,aes(x = ntrees, y = value)) + geom_line() + 
+  facet_wrap(~variable, scales = "free",labeller = label_parsed) +
+  labs(title = "Forest size",
+       x = expression(italic(n[tree]):~"Number of trees")) +
+  theme_bw() +
+  theme(axis.title.y = element_blank())
+tree_rmse_plot <- tree_rmse_plot + geom_hline(data = lm_accuracy_data, aes(yintercept = value),linetype = 1, col = cbPalette[[6]])
+```
+
+```{r}
+plot_data <- reshape2::melt(caret_fit$results[,c("mtry","RMSE","Rsquared")],id = "mtry")
+plot_data$sd <- reshape2::melt(caret_fit$results[,c("RMSESD","RsquaredSD")])$value
+levels(plot_data$variable) <- c("RMSE","italic(R)^2")
+cv_error_vs_mtry_plot <- ggplot(data = plot_data,aes(x = mtry, y = value,ymin = value - 2 * sd,ymax = value + 2 * sd)) + 
+  facet_wrap(~variable,scales = "free",
+             labeller=label_parsed) + geom_point()+geom_line() + geom_errorbar() + 
+  labs(title = "Variables per node",
+       x = expression(italic(m[try]):~"Number of variables drawn per tree node")) + 
+  theme_bw()+ theme(axis.title.y = element_blank())
+
+
+# cv_error_vs_mtry_plot + geom_hline(data = lm_accuracy_data, aes(yintercept = value),linetype = 2, col = cbPalette[[6]])
+cv_error_vs_mtry_plot <- cv_error_vs_mtry_plot + geom_ribbon(data = ribbon_data, mapping = aes(ymax = value + 2 * SD, 
+                                                  ymin = value - 2 * SD,x = x), linetype = 2, fill = cbPalette[[6]],alpha = 0.2)
+```
+
+```{r}
+pdf(file = "figs/CV-tuning.pdf",width = 7,height = 7)
+ggarrange(tree_rmse_plot, cv_error_vs_mtry_plot, nrow = 2)
+dev.off()
+```
+
+```{r}
+library(randomForest)
+
+larger_model <- randomForest(
+  x = model.matrix(object = formula,data = data_list[[r]])[,-1],
+                   y = data_list[[r]][,1],ntree = 1000,
+  mtry = caret_fit$bestTune$mtry,importance = TRUE,keep.inbag = TRUE
+)
+
+rf_importance <- larger_model$importance
+rf_importanceSD <- larger_model$importanceSD
+
+rf_importance_data <- data.frame(
+  covariate = names(rf_importanceSD),
+  importance = rf_importance[,1],
+  sd = rf_importanceSD,stringsAsFactors = FALSE
+)
+
+rf_importance_data$covariate <- factor(
+  rf_importance_data$covariate,
+  levels = rf_importance_data$covariate[
+    order(-rf_importance_data$importance)])
+
+var_import_plot <- ggplot(data =rf_importance_data, aes(x = covariate, y = importance, ymin= importance - 2 * sd, ymax = importance + 2 * sd)) +
+  geom_col(stat = "identity") + geom_errorbar(width = 0.5) + 
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 315,hjust = 0))+
+  labs(x = "Covariate", y = "Mean Increase in MSE",title = "Individual variable importance")+
+  theme(plot.margin = ggplot2::margin(0, 0.5, 0, 0, "cm"))
+var_import_plot
+```
+
+```{r}
+hclust_res <- hclust(
+  d = as.dist(1-abs(cor(data_list[[r]][,!(colnames(data_list[[r]]) %in% c(r,"cluster"))]))),
+  method = "complete")
+plot(hclust_res,sub = "",xlab = "Covariates")
+
+var_groups <- cutree(hclust_res,h = 0.3)
+var_groups
+```
+
+```{r}
+var_groups <- c(var_groups,max(var_groups)+1,max(var_groups)+1)
+input_data <- Benchtools:::newdata_caret_prepare(newdata = data_list[[r]],caret_fit)
+names(var_groups) <- colnames(input_data)
+var_group_names <- sort(unique(var_groups))
+var_group_names
+var_group_list <- lapply(var_group_names,function(x) which(var_groups == x)-1)
+```
+
+```{r}
+group_importance <- varImpGroup(larger_model, xdata = input_data, 
+            ngroups = length(var_group_names), nvarGroup = table(var_groups),
+            idxGroup = var_group_list, groupsNames = var_group_names)
+
+group_names <- sapply(var_group_list,FUN = function(x){
+  paste0(
+    names(var_groups)[x+1],collapse = ",\n"
+  )
+})
+
+rf_group_importance_data <- data.frame(
+  group_name = group_names,
+  importance = as.vector(group_importance),
+  stringsAsFactors = FALSE
+)
+print(group_importance)
+rf_group_importance_data$group_name <- factor(
+  rf_group_importance_data$group_name,
+  levels = rf_group_importance_data$group_name[
+    order(rf_group_importance_data$importance)])
+
+group_importance_plot <- ggplot(data =rf_group_importance_data, aes(y = group_name, x = importance, ymin= importance, ymax = importance)) +
+  geom_bar(stat = "identity") +
+  theme_bw()+
+  labs(x = "Mean Increase in MSE",title = "Group importance") +
+  theme(axis.title.y = element_blank())
+group_importance_plot
+```
+
+```{r,fig.height=9,fig.width=9}
+library(ggpubr)
+combined_plot1 <- ggarrange(cv_error_vs_mtry_plot,tree_rmse_plot,
+          group_importance_plot,var_import_plot,
+          nrow = 2,ncol =2,labels = c("(A)","(B)","(C)","(D)"),hjust = 0)
+dir.create("figs")
+pdf(file = "figs/combined_plot1.pdf",onefile = FALSE,width = 9,height = 9)
+combined_plot1
+dev.off()
+combined_plot1
+```
+
+```{r}
+plot_data %>% dplyr::filter(mtry == 4)
+```
+
+```{r}
+par(mfrow=c(5, 3))
+part_plot_data <- list()
+for (name in rf_importance_data$covariate){
+  part_plot_data[[name]] <- partialPlot(caret_fit$finalModel, pred.data = Benchtools:::newdata_caret_prepare(data_list[[r]],train_fit = caret_fit), eval(name), main=name, xlab=name,plot = FALSE)
+  part_plot_data[[name]] <- as.data.frame(do.call(part_plot_data[[name]],what= cbind))
+  part_plot_data[[name]]$covariate <- name
+}
+
+plot_data <- do.call(part_plot_data,what = rbind)
+ggplot(data = plot_data,aes(x = x, y = y)) + geom_line() + facet_wrap(~covariate,scales = "free")
+```
+
+
+
+```{r}
+vars <- as.character(rf_importance_data$covariate[order(-rf_importance_data$importance)])
+source("plot_partial_dependence.R")
+pdp_data <- as.data.frame(Benchtools:::newdata_caret_prepare(data_list[[r]],train_fit = caret_fit))
+pdp_data[[r]] <- data_list[[r]][[r]]
+pdp_plots <- plot_partial_dependence(
+  data = pdp_data,r = r, 
+  rf_model = caret_fit$finalModel,R = 100,
+  n_cores = 5,
+  cov_set = vars,
+  n_grid_points = 40)
+
+car::vif(mod = lm(data = pdp_data, as.formula(paste0(r," ~ ."))))
+
+ggpubr::ggarrange(plotlist = pdp_plots,nrow = 4, ncol = 4)
+```
+```{r,fig.height=5,fig.width=9}
+# pdp_plots <- lapply(pdp_plots,function(x){x + theme_bw()})
+pdp_plot_combined <- ggpubr::ggarrange(plotlist = lapply(pdp_plots[1:8],FUN = function(x){x + theme_bw()}),nrow = 2, ncol = 4)
+
+dir.create("figs")
+pdf(file = "figs/partial-dependence-plots2.pdf",onefile = FALSE,width = 9,height = 5)
+pdp_plot_combined
+dev.off()
+pdp_plot_combined
+```
+
+```{r,fig.height=8,fig.width=9}
+library(gridExtra)
+library(grid)
+lay <- rbind(
+  c(11,11,11,11),
+  c(1,2,3,4),
+  c(5,6,7,8),
+  c(9,9,10,10),
+  c(9,9,10,10)
+)
+
+blah <- grid.arrange(grobs = list(
+    ggplotGrob(pdp_plots_top8[[1]]),
+    ggplotGrob(pdp_plots_top8[[2]]),
+    ggplotGrob(pdp_plots_top8[[3]]),
+    ggplotGrob(pdp_plots_top8[[4]]),
+    ggplotGrob(pdp_plots_top8[[5]]),
+    ggplotGrob(pdp_plots_top8[[6]]),
+    ggplotGrob(pdp_plots_top8[[7]]),
+    ggplotGrob(pdp_plots_top8[[8]]),
+    ggplotGrob(var_import_plot + theme(plot.margin = unit(c(15.5,5.5,5.5,5.5),"points"))),
+    ggplotGrob(group_importance_plot + theme(plot.margin = unit(c(15.5,5.5,5.5,5.5),"points"))),
+    grobTree(rectGrob(gp=gpar(fill="transparent", alpha=0)), text_grob("Partial Dependence",hjust = 0,x = 0.05,size = 11 * 1.2))), 
+    layout_matrix = lay,heights = c(0.3,2,2,2.15,2.15))
+
+pdf(file = "figs/combined-rf-interpret.pdf",onefile = FALSE,width = 9,height = 8)
+grid.draw(blah)
+dev.off()
+```
+```{r}
+
+```
+
+```{r}
+boot_resids1 <- bootstrap_residuals(orig_data = data_list[[r]],
+                                   caret_fit = caret_fit,
+                                   n_resamples = 1000,
+                                   ncores = 6,
+                                   verbose = TRUE,
+                                   force_OOB = TRUE,
+                                   strata = clusters
+                                   )
+
+boot_resids2 <- bootstrap_residuals(orig_data = data_list[[r]],
+                                   caret_fit = caret_fit,
+                                   n_resamples = 1000,
+                                   ncores = 6,
+                                   verbose = TRUE,
+                                   force_OOB = FALSE,
+                                   strata = clusters
+                                   )
+```
+
+```{r}
+library(tibble)
+plot_data <- tibble(type = "All residuals", value = c(boot_resids2))
+temp <- tibble(type = "Out-of-Resample", value = c(boot_resids1))
+plot_data <- rbind(
+  plot_data,
+  temp
+)
+```
+
+```{r}
+
+density_plots_boot <- plot_data %>% ggplot() + 
+  geom_density(aes(x = value, group = type,fill = type),alpha = 0.8) +
+  labs(title = "Bootstrap residual distributions",y = "Density",x = "Residual value", fill = "Type") +
+  scale_fill_manual(values = cbPalette) + theme_bw()
+density_plots_boot
+mean(c(boot_resids2) < 1e-20)
+
+```
+
+```{r}
+p1 <- ggplot() + geom_histogram(aes(x = c(boot_resids1)),bins = 100)
+p2 <- ggplot() + geom_histogram(aes(x = c(boot_resids2)),bins = 100)
+length(boot_resids1)
+n_non_missing <- sum(!is.na(boot_resids1))
+p_non_missing <- mean(!is.na(boot_resids1))
+
+p1 + labs(title = "Out-of-Resample bootstrap replicates",subtitle = paste0(n_non_missing, " non-missing values (", round(p_non_missing*100,2),"%)"), x = "Replicate value", y = "Count")
+p2 + labs(title = "All bootstrap replicates", x = "Replicate value",y = "Count")
+
+br1 <- reshape2::melt(boot_resids1)
+br1$cluster <- as.factor(clusters[br1$Var1])
+library(dplyr)
+cluster_stats1 <- br1 %>% group_by(cluster) %>% summarise(
+  Mean = mean(value,na.rm = TRUE), 
+  Median = median(value,na.rm = TRUE)) %>% reshape2::melt(id = "cluster")
+cluster_stats2 <- br1 %>% group_by(cluster) %>% summarise(
+  lower = quantile(value,0.25,na.rm = TRUE), 
+  upper = quantile(value,0.75,na.rm = TRUE))
+violin_plots_peer_groups <- ggplot() + geom_violin(data = br1,aes(y = value,x = cluster),fill = "grey50") +
+  scale_fill_manual(values = cbPalette) + 
+  geom_point(data = cluster_stats1,aes(x = cluster, y = value, shape = variable)) +
+  geom_errorbar(data = cluster_stats2,aes(x = cluster, ymin = lower, ymax = upper),width = 0.25) + 
+  labs(title = "OOR residuals by Peer Group",x = "Peer Group", y = "Bootstrap residual", fill = "Peer Group",shape = NULL) +
+  theme_bw()
+```
+
+```{r,warning=FALSE,message=FALSE,fig.width=8,fig.height=3}
+pdf(file = "figs/bootstrap_plots_combined.pdf",width=8,height=4,onefile = FALSE)
+ggarrange(density_plots_boot + theme(legend.position = "bottom"),
+          violin_plots_peer_groups + theme(legend.position = "bottom"))
+dev.off()
+
+ggarrange(density_plots_boot + theme(legend.position = "bottom"),
+          violin_plots_peer_groups + theme(legend.position = "bottom"))
+```
+
+```{r}
+mean_bs_resids <- apply(boot_resids1,1,mean,na.rm = TRUE)
+min = which.min(mean_bs_resids)
+max = which.max(mean_bs_resids)
+ids <- c(min,order(mean_bs_resids)[c(50,100,150)],max)
+id_label = c("Lowest (Rank 200)","Low (Rank 150)","Middle (Rank 100)","High (Rank 50)","Highest  (Rank 1)")
+# clusters[ids]
+id_label2 <- paste0("Peer Group: ",clusters[ids])
+plot_list <- list()
+for(i in 1:length(ids)){
+  
+  # select closest observations in the peer group:
+  dissims <- 1-caret_fit$finalModel$proximity[ids[[i]],]
+  dissims[clusters != clusters[ids[[i]]]] <- Inf
+  neighbors <- order(abs(dissims))[-1][1:10]
+  
+  plot_list[[i]] <- list()
+  plot_list[[i]][[1]] <- ggplotGrob(spirit_level_plot(
+    bootstrap_residuals = boot_resids1,
+    original_data = data_list[[r]],
+    response = r,
+    index = ids[[i]],
+    clusters = NULL,
+    quantile_probs = c(0,0.1,0.25,0.5,0.75,0.9,1),
+    rescale_vals = response_scalings[[r]],
+    inverse_transform = function(x){exp(x)-1},
+    other_entities = neighbors,
+    label_digits = 0,text_gap = 0.3
+  ) + labs(title = id_label[i]) + theme(title = element_blank()))
+  plot_list[[i]][[2]] <- ggplotGrob(spirit_level_plot(
+    bootstrap_residuals = boot_resids1,
+    original_data = data_list[[r]],
+    response = r,
+    index = ids[[i]],
+    clusters = clusters,
+    quantile_probs = c(0,0.1,0.25,0.5,0.75,0.9,1),
+    rescale_vals = response_scalings[[r]],
+    inverse_transform = function(x){exp(x)-1},
+    other_entities = neighbors,label_digits = 0,text_gap = 0.3
+  ) + labs(title = id_label2[i]) + theme(title = element_blank()))
+  
+  plot_list[[i]][[3]] <- ggplotGrob(ggplot() + geom_density(mapping = aes(x = c(boot_resids1),y=2 * ..density..),fill = cbPalette[7],alpha = 0.5) +
+  geom_density(mapping = aes(x = c(boot_resids1[clusters == clusters[ids[[i]]],]),y=1 * ..density..),fill = cbPalette[6],alpha = 0.5)+
+  geom_density(mapping = aes(x = c(boot_resids1[ids[[i]],]),y=0.1 * ..density..),fill = cbPalette[5],alpha = 0.5) +
+  theme_minimal() + 
+  theme(axis.text = element_blank(),axis.ticks = element_blank(),axis.title = element_blank()))
+  
+}
+plot_list <- unlist(plot_list,recursive = FALSE)
+```
+
+
+<!-- ```{r,fig.asp=1} -->
+<!-- ggpubr::ggarrange(plotlist = plot_list,ncol = 3,nrow = length(plot_list)/2) -->
+<!-- ``` -->
+
+```{r}
+
+plot_list[[length(plot_list)+1]] <- grobTree(rectGrob(gp=gpar(fill="transparent", alpha=0.5)), textGrob("Cohort"))
+plot_list[[length(plot_list)+1]] <- grobTree(rectGrob(gp=gpar(fill="transparent", alpha=0.5)), textGrob("Peer Group"))
+plot_list[[length(plot_list)+1]] <- grobTree(rectGrob(gp=gpar(fill="transparent", alpha=0.5)), textGrob("Density"))
+plot_list[[length(plot_list)+1]] <- grobTree(rectGrob(gp=gpar(fill="transparent", alpha=0.5)), textGrob(paste0(id_label[1],"\n",id_label2[1])))
+plot_list[[length(plot_list)+1]] <- grobTree(rectGrob(gp=gpar(fill="transparent", alpha=0.5)), textGrob(paste0(id_label[2],"\n",id_label2[2])))
+plot_list[[length(plot_list)+1]] <- grobTree(rectGrob(gp=gpar(fill="transparent", alpha=0.5)), textGrob(paste0(id_label[3],"\n",id_label2[3])))
+plot_list[[length(plot_list)+1]] <- grobTree(rectGrob(gp=gpar(fill="transparent", alpha=0.5)), textGrob(paste0(id_label[4],"\n",id_label2[4])))
+plot_list[[length(plot_list)+1]] <- grobTree(rectGrob(gp=gpar(fill="transparent", alpha=0.5)), textGrob(paste0(id_label[5],"\n",id_label2[5])))
+
+```
+
+```{r}
+library(gridExtra)
+library(grid)
+lay <- rbind(
+  c(NA,16,17,18),
+  c(19,1,2,3),
+  c(20,4,5,6),
+  c(21,7,8,9),
+  c(22,10,11,12),
+  c(23,13,14,15)
+)
+
+pdf(file = "figs/combined_adj_perf_plot.pdf",width = 9,height=7)
+grid.arrange(grobs = plot_list, layout_matrix = lay,heights = c(1,2,2,2,2,2),widths = c(1,2,2,1))
+dev.off()
+grid.arrange(grobs = plot_list, layout_matrix = lay,heights = c(1,2,2,2,2,2),widths = c(1,2,2,1))
+
+```
+
+
+```{r}
+boot_mean <-apply(boot_resids1,MARGIN = 1,mean,na.rm = TRUE)
+cov_matrix <- cov(t(boot_resids1),use = "pairwise.complete")
+
+# Get the closest symmetric definite matrix:
+decomp <- eigen(cov_matrix)
+lambda <- decomp$values
+lambda[lambda < 0] <- 0
+sym_def_mat <- decomp$vectors %*% diag(lambda) %*% t(decomp$vectors)
+
+# 
+gauss_boot_resids <- t(MASS::mvrnorm(n = 20000,mu = boot_mean,Sigma = sym_def_mat))
+boot_norm_data <- data.frame(comparison = character(),value = numeric(),approx_value = numeric())
+png(filename = "first-order-boot-norm-comp.png", width=5, height=5,
+    units="in", res=400, pointsize=8)
+{
+par(mfrow = c(2,2))
+boot_mean <- apply(boot_resids1,1,mean,na.rm = TRUE)
+gauss_mean <- apply(gauss_boot_resids,1,mean)
+temp <- data.frame(
+  comparison = "Mean",
+  value = boot_mean,
+  approx_value = gauss_mean
+)
+boot_norm_data <- rbind(boot_norm_data,
+                        temp)
+plot(y = gauss_mean,x = boot_mean,
+     xlab = "Bootstrap",ylab = "Normal approximation",main = "Mean")
+abline(0,1,col = "red")
+boot_median <- apply(boot_resids1,1,median,na.rm = TRUE)
+gauss_median <- apply(gauss_boot_resids,1,median)
+temp <- data.frame(
+  comparison = "Median",
+  value = boot_median,
+  approx_value = gauss_median
+)
+boot_norm_data <- rbind(boot_norm_data,
+                        temp)
+plot(y = gauss_median,x = boot_median,
+     xlab = "Bootstrap",ylab = "Normal approximation",main = "Median")
+abline(0,1,col = "red")
+
+boot_sd <- apply(boot_resids1,1,sd,na.rm = TRUE)
+gauss_sd <- apply(gauss_boot_resids,1,sd)
+temp <- data.frame(
+  comparison = "Standard Deviation",
+  value = boot_median,
+  approx_value = gauss_median
+)
+boot_norm_data <- rbind(boot_norm_data,
+                        temp)
+
+plot(y = gauss_sd,x = boot_sd,
+     xlab = "Bootstrap",ylab = "Normal approximation",main = "Standard Deviation")
+abline(0,1,col = "red")
+
+boot_IQR <- apply(boot_resids1,1,IQR,na.rm = TRUE)
+gauss_IQR <- apply(gauss_boot_resids,1,IQR)
+temp <- data.frame(
+  comparison = "Interquartile Range",
+  value = boot_IQR,
+  approx_value = gauss_IQR
+)
+boot_norm_data <- rbind(boot_norm_data,
+                        temp)
+
+plot(y = gauss_IQR,x = boot_IQR,
+     xlab = "Bootstrap",ylab = "Normal approximation",main = "Interquartile Range")
+abline(0,1,col = "red")
+}
+dev.off()
+
+# Compute pairwise differences:
+comparison <- expand.grid(row = 1:200,col = 1:200)
+library(tidyverse)
+comparison <- comparison %>% filter(row != col)
+comparison <- comparison %>% filter(row < col)
+comparison$mean_diff_boot <- NA
+comparison$sd_diff_boot <- NA
+comparison$sd_diff_gauss <- NA
+comparison$Pr_lower_boot <- NA
+comparison$Pr_lower_gauss <- NA
+comparison$mean_diff_gauss <- NA
+comparison$cov_boot <- NA
+comparison$cov_gauss <- NA
+comparison$cor_boot <- NA
+comparison$cor_gauss <- NA
+
+for(i in 1:nrow(comparison)){
+  row <- comparison$row[i]
+  col <- comparison$col[i]
+  diff <- boot_resids1[row,] - boot_resids1[col,]
+  diff <- diff[!is.na(diff)]
+  comparison$Pr_lower_boot[i] <- mean(diff < 0)
+  comparison$mean_diff_boot[i] <- mean(diff)
+  comparison$sd_diff_boot[i] <- sd(diff)
+  diff <- gauss_boot_resids[row,] - gauss_boot_resids[col,]
+  diff <- diff[!is.na(diff)]
+  comparison$Pr_lower_gauss[i] <- mean(diff < 0)
+  comparison$mean_diff_gauss[i] <- mean(diff)
+  comparison$sd_diff_gauss[i] <- sd(diff)
+  comparison$cov_boot[i] <- cov(boot_resids1[row,],boot_resids1[col,],use = "pairwise.complete.obs")
+  comparison$cov_gauss[i] <- cov(gauss_boot_resids[row,],gauss_boot_resids[col,],use = "pairwise.complete.obs")
+  comparison$cor_boot[i] <- cor(boot_resids1[row,],boot_resids1[col,],use = "pairwise.complete.obs")
+  comparison$cor_gauss[i] <- cor(gauss_boot_resids[row,],gauss_boot_resids[col,],use = "pairwise.complete.obs")
+}
+
+temp <- data.frame(
+  comparison = "Pr(Difference < 0)",
+  value = comparison$Pr_lower_boot,
+  approx_value = comparison$Pr_lower_gauss
+)
+boot_norm_data <- rbind(boot_norm_data,
+                        temp)
+
+temp <- data.frame(
+  comparison = "Mean Difference",
+  value = comparison$mean_diff_boot,
+  approx_value = comparison$mean_diff_gauss
+)
+boot_norm_data <- rbind(boot_norm_data,
+                        temp)
+
+temp <- data.frame(
+  comparison = "Pearson Correlation",
+  value = comparison$cor_boot,
+  approx_value = comparison$cor_gauss
+)
+boot_norm_data <- rbind(boot_norm_data,
+                        temp)
+
+temp <- data.frame(
+  comparison = "SD of Difference",
+  value = comparison$sd_diff_boot,
+  approx_value = comparison$sd_diff_gauss
+)
+boot_norm_data <- rbind(boot_norm_data,
+                        temp)
+
+
+png(filename = "second-order-boot-norm-comp.png", width=5, height=5,
+    units="in", res=400, pointsize=8)
+par(mfrow = c(2,2))
+plot(data = comparison, mean_diff_boot ~ mean_diff_gauss,
+     xlab = "Bootstrap",ylab = "Normal approximation",main = "Mean Difference",col = scales::alpha(1, 0.4))
+abline(0,1,col = "red")
+
+plot(data = comparison, Pr_lower_gauss ~ Pr_lower_boot,
+     xlab = "Bootstrap",ylab = "Normal approximation",main = expression(bold(Pr(Diff < 0))),col = scales::alpha(1, 0.4))
+abline(0,1,col = "red")
+
+plot(data = comparison, sd_diff_boot ~ sd_diff_gauss,
+     xlab = "Bootstrap",ylab = "Normal approximation",main = "SD Difference",col = scales::alpha(1, 0.4))
+abline(0,1,col = "red")
+# 
+# plot(data = comparison, cov_boot ~ cov_gauss,
+#      xlab = "Bootstrap",ylab = "Normal approximation",main = "Covariance",col = scales::alpha(1, 0.4))
+# abline(0,1,col = "red")
+
+plot(data = comparison, cor_boot ~ cor_gauss,
+     xlab = "Bootstrap",ylab = "Normal approximation",main = "Correlation",col = scales::alpha(1, 0.4))
+abline(0,1,col = "red")
+dev.off()
+```
+
+```{r,fig.width=8,fig.height=3.5}
+full_boot_norm_comp_plot <- boot_norm_data %>% 
+  mutate(comparison = factor(comparison,levels = c("Mean","Median","Standard Deviation",
+                                                   "Interquartile Range","Mean Difference",
+                                                   "SD of Difference","Pr(Difference < 0)",
+                                                   "Pearson Correlation"))) %>%
+  ggplot(aes(x = value, y = approx_value)) + 
+  geom_point(alpha = 0.2,size= 0.5) + geom_abline(slope = 1,intercept = 0) + 
+  facet_wrap(~comparison,scales = "free",nrow = 2) +
+  theme_bw() + labs(x = "Bootstrap distribution value",
+                    y = "Gaussian approximation value") 
+# pdf(file = "figs/full_boot_norm_comp_plot.pdf",width = 8,height = 3.5)
+# full_boot_norm_comp_plot
+# dev.off()
+# full_boot_norm_comp_plot
+
+png(file = "figs/full_boot_norm_comp_plot.png",width = 8,height = 3.5,units="in", res=1000, pointsize=8)
+full_boot_norm_comp_plot
+dev.off()
+# full_boot_norm_comp_plot
+```
+
+
+```{r}
+important_variables <- caret_fit$finalModel$importance
+important_variables <- rownames(important_variables)[order(-important_variables[,2])[1:5]]
+plot_data <- data_list[[r]][,c(important_variables,"cluster")]
+plot_data$id <- 1:nrow(plot_data)
+
+# select closest observations in the peer group:
+id = ids[1]
+dissims <- 1-caret_fit$finalModel$proximity[id,]
+dissims[clusters != clusters[id]] <- Inf
+neighbors <- order(abs(dissims))[-1][1:10]
+
+quantilate <- Benchtools:::quantilate
+p1 <- plot_as_percentiles(
+  data = plot_data,
+  grouping_variable = cluster,
+  main_id = 1,
+  id_variable = id,
+  highlight_ids = neighbors,
+  colour_palette = colorRampPalette(c("#E69F00", "white", "#56B4E9"))(10)
+) +
+  theme_minimal() +
+  theme(axis.line = element_blank(),
+        axis.text.y = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank()) +
+  theme(strip.text.y.left = element_text(angle = 0,hjust = 1)) + 
+  labs(title = id_label[1])
+
+id = ids[5]
+dissims <- 1-caret_fit$finalModel$proximity[id,]
+dissims[clusters != clusters[id]] <- Inf
+neighbors <- order(abs(dissims))[-1][1:10]
+
+quantilate <- Benchtools:::quantilate
+p2 <- plot_as_percentiles(
+  data = plot_data,
+  grouping_variable = cluster,
+  main_id = 1,
+  id_variable = id,
+  highlight_ids = neighbors,
+  colour_palette = colorRampPalette(c("#E69F00", "white", "#56B4E9"))(10)
+) +
+  theme_minimal() +
+  theme(axis.line = element_blank(),
+        axis.text.y = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank()) +
+  theme(strip.text.y.left = element_text(angle = 0,hjust = 1))+
+  labs(title = id_label[5])
+```
+
+```{r,message=FALSE,warning=FALSE,fig.width=9,fig.height=3}
+pdf(file = "figs/percentile_plots.pdf",width = 7.5,height = 2.5,onefile = FALSE)
+ggpubr::ggarrange(
+  p1+ ggplot2::scale_x_continuous(breaks = seq(0, 1, length.out = 11), 
+            labels = custom_label),
+  p2+ ggplot2::scale_x_continuous(breaks = seq(0, 1, length.out = 11), 
+            labels = custom_label),
+  nrow = 1, ncol =2
+)
+dev.off()
+
+ggpubr::ggarrange(
+  p1+ ggplot2::scale_x_continuous(breaks = seq(0, 1, length.out = 11), 
+            labels = custom_label),
+  p2+ ggplot2::scale_x_continuous(breaks = seq(0, 1, length.out = 11), 
+            labels = custom_label),
+  nrow = 1, ncol =2
+)
+#ggsave("example-percentile-plot.png")
+```
+
+```{r}
+rankings <- get_bootstrap_rankings(
+  boot_resids = boot_resids1,
+  alpha_level = 0.9,
+  group = data_list[[r]]$cluster,n_samples = 10000)
+```
+
+```{r}
+rankings$residual_stats
+```
+
+```{r}
+plot_data <- rankings$residual_stats
+
+ggplot(data = plot_data) + 
+  geom_errorbar(aes(x = mean_resid, ymin = lower_rank, ymax = upper_rank))
+```
+
+```{r}
+ggplot(data = plot_data) + 
+  geom_errorbar(aes(x = mean_resid, ymin = lower_rank, ymax = upper_rank)) + 
+  geom_point(aes(x = mean_resid, y = mean_rank))
+```
+
+```{r}
+plot_data$cluster <- factor(clusters,levels = 1:3)
+ggplot(data = plot_data) + 
+  geom_errorbar(aes(x = mean_resid, ymin = lower_rank, ymax = upper_rank,colour = cluster)) + 
+  geom_point(aes(x = mean_resid, y = mean_rank,colour = cluster))
+```
+
+```{r}
+plot(rankings$full_rank_dist[1,])
+rankings$full_rank_dist[,1]
+plot(rankings$full_rank_dist[2,],type = "h")
+segments(x0 = rankings$residual_stats[2,]$lower_rank,y0= 50, x1 = rankings$residual_stats[2,]$upper_rank,y1 = 50)
+sum(rankings$full_rank_dist[2,1:rankings$residual_stats$lower_rank[2]])/sum(rankings$full_rank_dist[2,])
+mean(rankings$full_rank_dist[2,] > rankings$residual_stats$lower_rank[2])
+apply(rankings$full_rank_dist,2,quantile,p = .05)
+```
+
+```{r}
+plot_data %>% filter(cluster == 1, (-lower_rank + upper_rank) > 75, mode_rank > 150)
+```
+
+```{r}
+
+```
+
+
+```{r}
+plot(data = plot_data, I(-lower_rank + upper_rank) ~ sd_resid)
+```
+
+```{r}
+plot(data = plot_data, I(-lower_rank + upper_rank) ~ mode_rank)
+```
+
+```{r}
+
+```
+
+```{r}
+plot_data <- rankings$group_stats
+plot_data$mean_resid <- apply(X = boot_resids1,MARGIN = 1,FUN = mean,na.rm=TRUE)
+p1 <- ggplot(data = plot_data) + 
+  geom_errorbar(aes(x = mean_resid, ymin = lower_rank, ymax = upper_rank)) + 
+  geom_point(aes(x = mean_resid, y = mean_rank)) + 
+  facet_grid(group ~ .,scales = "free_y") + xlab("Mean Residual") + ylab("Within-Peer Group Rank") +
+  theme_bw()
+```
+
+```{r}
+p2 <- ggplot() + geom_point(data = rankings$residual_stats,aes(colour = sd_resid, y = upper_rank - lower_rank,x = abs(mean_resid))) +
+  labs(x = "Magnitude of Mean Residual",
+       y = "Range of Rank 90% CI",
+       colour = "Standard Error\nof Residual") + 
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+```{r,fig.width=8,fig.height=4}
+pdf(file = "figs/rank_plots_combined.pdf",onefile = FALSE,width = 8,height=4)
+ggarrange(p1,p2)
+dev.off()
+ggarrange(p1,p2)
+```
+
+```{r}
+index = 1
+plot_naplan(
+  observed_value = data_list$response2[index],
+  middle_value = predict(newdata = data[index,], object = caret_fit),
+  inner_values = Benchtools::predict_interval(newdata = data[index,], object = caret_fit,level = 0.67,simulate = FALSE),
+  outer_values = Benchtools::predict_interval(newdata = data[index,], object = caret_fit,level = 0.95,simulate = FALSE),
+  n_digits_label = 0,
+  upper_text_margin = 0.05,
+  line_width = 0.2
+)
+
+boxplot(plot_data$mean_resid ~ clusters)
+abline(0,0)
+```
+
+```{r}
+index = 1
+dissims <- 1-caret_fit$finalModel$proximity[1,]
+neighbors <- order(abs(dissims))[-1][1:10]
+spirit_level_plot(
+  bootstrap_residuals = boot_resids,
+  original_data = data_list[[r]],
+  response = r,
+  index = 180,
+  clusters = NULL,
+  quantile_probs = c(0,0.1,0.25,0.5,0.75,0.9,1),
+  rescale_vals = response_scalings[[r]],
+  inverse_transform = function(x){exp(x)-1},
+  other_entities = neighbors
+)
+```
+
+```{r}
+important_variables <- caret_fit$finalModel$importance
+important_variables <- rownames(important_variables)[order(-important_variables[,2])[1:5]]
+plot_data <- data_list[[r]][,c(important_variables,"cluster")]
+plot_data$id <- 1:nrow(plot_data)
+Benchtools::plot_as_percentiles(
+  data = plot_data,
+  grouping_variable = cluster,
+  main_id = 1,
+  id_variable = id,
+  highlight_ids = neighbors
+) +
+  theme_minimal() +
+  theme(axis.line = element_blank(),
+        axis.text.y = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank()) +
+  theme(strip.text.y = element_text(angle = 180,hjust = 1))
+ggsave("example-percentile-plot.png")
+``` 
+
+
+```{r}
+
+N_boot <- 10000
+rf_mse_results <- lm_mse_results <- rep(NA,N_boot)
+rf_r2_results <- lm_r2_results <- rep(NA,N_boot)
+for(b in 1:N_boot){
+ids <- sample(1:nrow(data_list[[r]]),size = nrow(data_list[[r]]),replace = TRUE)
+out_of_sample <- which(!(1:nrow(data_list[[r]]) %in% ids))
+boot_data <- data_list[[r]][ids,]
+
+rf_fit <- randomForest(formula, data = boot_data,
+                       ntree = 300,mtry = 3)
+lm_fit <- lm(data = boot_data,formula = formula)
+
+mse_rf <- mean((data_list[[r]][[r]][out_of_sample] - predict(rf_fit,newdata = data_list[[r]][out_of_sample,]))^2)
+mse_lm <- mean((data_list[[r]][[r]][out_of_sample] - predict(lm_fit,newdata = data_list[[r]][out_of_sample,]))^2)
+r2_rf <- 1 - mse_rf / var(data_list[[r]][[r]][out_of_sample])
+r2_lm <- 1 - mse_lm / var(data_list[[r]][[r]][out_of_sample])
+rf_mse_results[b] <- mse_rf
+lm_mse_results[b] <- mse_lm
+rf_r2_results[b] <- r2_rf
+lm_r2_results[b] <- r2_lm
+}
+
+plot(sqrt(rf_mse_results) ~ sqrt(lm_mse_results),xlim = c(0,2))
+abline(0,1)
+sd(rf_mse_results - lm_mse_results)
+plot(rf_r2_results ~ lm_r2_results)
+abline(0,1)
+sd(rf_r2_results - lm_r2_results)
+
+```
+
+Covariate 8 step function.
+
+```{r}
+predict_data %>% 
+  filter(variable == "covariate8") %>% 
+  mutate(MIN = value != min(value)) %>% 
+  pivot_longer(cols = c('LR_residual','RF_residual'),names_to ="residual_type",values_to = "residual") %>% 
+  ggplot(aes(x = MIN, y = residual,colour = residual_type)) + geom_boxplot()
+
+ends_with("_residual")         
+
+dev.off()
+plot(data = data_list[[r]],response1 ~ I(covariate8!=min(data_list[[r]]$covariate8)))
+predict_data %>% 
+  filter(variable == "covariate8") %>% 
+  mutate(MIN = value == min(value)) %>% 
+  pivot_longer(cols = c('LR_residual','RF_residual'),names_to ="residual_type",values_to = "residual") %>% 
+  group_by(residual_type,MIN) %>% 
+  summarise(RMSE = sqrt(mean(residual^2)))
+```
